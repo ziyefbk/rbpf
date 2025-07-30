@@ -47,6 +47,7 @@ pub mod vm;
 mod x86;
 pub mod tnum;
 pub mod tnum_plus;
+pub mod wrapped_interval;
 
 trait ErrCheckedArithmetic: Sized {
     fn err_checked_add(self, other: Self) -> Result<Self, ArithmeticOverflow>;
