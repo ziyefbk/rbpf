@@ -88,6 +88,9 @@ fn main() {
         ("sub", Box::new(|a, b| a.sub(b))),
         ("mul", Box::new(|a, b| a.mul(b))),
         ("sdiv", Box::new(|a, b| a.sdiv(b))),
+        ("udiv", Box::new(|a, b| a.udiv(b))),
+        ("srem", Box::new(|a, b| a.srem(b))),
+        ("urem", Box::new(|a, b| a.urem(b))),
     ];
 
     for _ in 0..n {

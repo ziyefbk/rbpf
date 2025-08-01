@@ -643,41 +643,7 @@ impl Tnum {
         return rem;
     }
 
-    /// Signed division
-    pub fn sdiv(&self, other: Self) -> Self {
-        if self.is_bottom() || other.is_bottom() {
-            return Self::bottom();
-        }
-        if self.is_top() || other.is_top() {
-            return Self::top();
-        }
-
-        // A tnum can represent 0 if its value part is 0, assuming
-        // the invariant `(value & mask) == 0`.
-        // `contains(0)` is `(0 & !mask) == value`, which is `value == 0`.
-        if other.value == 0 && other.is_singleton() {
-            return Self::top();
-        }
-
-        if self.is_singleton() && other.is_singleton() {
-            let val = (self.value as i64).wrapping_div(other.value as i64);
-            return Self::new(val as u64, 0);
-        }
-
-        let t0 = self.get_zero_circle();
-        let t1 = self.get_one_circle();
-        let x0 = other.get_zero_circle();
-        let x1 = other.get_one_circle();
-
-        let res00 = t0.signed_div(x0);
-        let res01 = t0.signed_div(x1);
-        let res10 = t1.signed_div(x0);
-        let res11 = t1.signed_div(x1);
-
-        res00.join(res01).join(res10).join(res11)
-    }
-
-    /// More precise signed division
+    /// 有符号除法操作
     pub fn signed_div(&self, other: Self) -> Self {
         if self.is_bottom() || other.is_bottom() {
             return Self::bottom();
@@ -743,33 +709,62 @@ impl Tnum {
             }
         }
         result
+    }    
+
+    /// 有符号除法操作
+    pub fn sdiv(&self, other: Self) -> Self {
+        if self.is_bottom() || other.is_bottom() {
+            return Self::bottom();
+        }
+        if self.is_top() || other.is_top() {
+            return Self::top();
+        }
+
+        if other.value == 0 && other.is_singleton() {
+            return Self::top();
+        }
+
+        if self.is_singleton() && other.is_singleton() {
+            let val = (self.value as i64).wrapping_div(other.value as i64);
+            return Self::new(val as u64, 0);
+        }
+
+        let t0 = self.get_zero_circle();
+        let t1 = self.get_one_circle();
+        let x0 = other.get_zero_circle();
+        let x1 = other.get_one_circle();
+
+        let res00 = t0.signed_div(x0);
+        let res01 = t0.signed_div(x1);
+        let res10 = t1.signed_div(x0);
+        let res11 = t1.signed_div(x1);
+
+        res00.join(res01).join(res10).join(res11)
     }
 
-    // Based on crab-llvm tnum::getSignedMinValue.
+    
+
     fn get_signed_min_value(&self) -> u64 {
-        if (self.value >> 63) & 1 == 1 { // is negative
+        if (self.value >> 63) & 1 == 1 { 
             self.value | self.mask
         } else {
             self.value
         }
     }
 
-    // Based on crab-llvm tnum::getSignedMaxValue.
     fn get_signed_max_value(&self) -> u64 {
-        if (self.value >> 63) & 1 == 1 { // is negative
+        if (self.value >> 63) & 1 == 1 { 
             self.value
         } else {
             self.value | self.mask
         }
     }
 
-    // Based on crab-llvm tnum::getZeroCircle.
     fn get_zero_circle(&self) -> Self {
         let new_mask = self.mask | (self.mask >> 1);
         Self::new(self.value & !new_mask, new_mask)
     }
 
-    // Based on crab-llvm tnum::getOneCircle.
     fn get_one_circle(&self) -> Self {
         let new_mask = self.mask | (self.mask >> 1);
         Self::new((self.value | self.mask) & !new_mask, new_mask)

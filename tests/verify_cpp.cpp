@@ -136,8 +136,13 @@ int main(int argc, char *argv[]) {
                 cpp_result = tnum_a * tnum_b;
             } else if (strcmp(operation, "sdiv") == 0) {
                 cpp_result = tnum_a.SDiv(tnum_b);
+            } else if (strcmp(operation, "udiv") == 0) {
+                cpp_result = tnum_a.UDiv(tnum_b);
+            } else if (strcmp(operation, "srem") == 0) {
+                cpp_result = tnum_a.SRem(tnum_b);
+            } else if (strcmp(operation, "urem") == 0) {
+                cpp_result = tnum_a.URem(tnum_b);
             }
-            // 在这里添加 else if 来处理其他操作
         }
         clock_gettime(CLOCK_MONOTONIC, &end);
         
@@ -151,7 +156,7 @@ int main(int argc, char *argv[]) {
         
         struct json_object *cpp_output_obj = json_object_new_object();
 
-        if (cpp_result.is_bottom()) {
+        if (cpp_result.is_bottom() || cpp_result.is_top()) {
             json_object_object_add(cpp_output_obj, "value", json_object_new_uint64(1));
             json_object_object_add(cpp_output_obj, "mask", json_object_new_uint64(1));
         } else {
