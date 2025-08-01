@@ -207,6 +207,11 @@ impl Tnum {
 
     /// tnum 的按位与操作
     pub fn and(&self, other: Self) -> Self {
+        if self.is_bottom() || other.is_bottom() {
+            return Self::bottom();
+        } else if self.is_top() || other.is_top() {
+            return Self::top();
+        }
         let alpha = self.value | self.mask;
         let beta = other.value | other.mask;
         let v = self.value & other.value;

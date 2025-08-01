@@ -51,10 +51,47 @@ struct Inconsistency {
     method: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct TnumValue {
     value: u64,
     mask: u64,
+}
+
+impl Serialize for TnumValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("TnumValue", 2)?;
+        state.serialize_field("value", &format!("{:064b}", self.value))?;
+        state.serialize_field("mask", &format!("{:064b}", self.mask))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TnumValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper {
+            value: u64,
+            mask: u64,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        Ok(TnumValue {
+            value: helper.value,
+            mask: helper.mask,
+        })
+    }
+}
+
+impl std::fmt::Display for TnumValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(value: {:064b}, mask: {:064b})", self.value, self.mask)
+    }
 }
 
 #[derive(Deserialize)]
@@ -159,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !inconsistencies.is_empty() {
         let json_output = serde_json::to_string_pretty(&inconsistencies)?;
-        let filename = "inconsistencies.json";
+        let filename = "./tests/build/inconsistencies.json";
         let mut file = File::create(filename)?;
         file.write_all(json_output.as_bytes())?;
         println!("\nInconsistent results saved to: {}", filename);

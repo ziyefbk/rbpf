@@ -58,8 +58,8 @@ test_utils = { path = "test_utils/" }
 rand = "0.8"
 
 [[bin]]
-name = "test_mul"
-path = "tests/tnum_mul.rs"
+name = "tnum_test"
+path = "tests/tnum_test.rs"
 
 [[bin]]
 name = "compare"
