@@ -429,3 +429,952 @@ impl Verifier for RequisiteVerifier {
         Ok(())
     }
 }
+
+use crate::{
+    reduced_product::ReducedProduct,
+    tnum::Tnum,
+    wrapped_interval::WrappedRange,
+};
+
+/// Abstract register state
+#[derive(Clone, Debug)]
+pub struct RegState {
+    pub domain: ReducedProduct,
+    pub initialized: bool,
+}
+
+impl Default for RegState {
+    fn default() -> Self {
+        Self {
+            domain: ReducedProduct::top(64),
+            initialized: false,
+        }
+    }
+}
+
+impl RegState {
+    /// Create a scalar register (unknown value)
+    pub fn new_scalar() -> Self {
+        Self {
+            domain: ReducedProduct::top(64),
+            initialized: true,
+        }
+    }
+
+    /// Create a constant register
+    pub fn new_constant(value: u64) -> Self {
+        Self {
+            domain: ReducedProduct::constant(value, 64),
+            initialized: true,
+        }
+    }
+
+    /// Synchronize Tnum and Range via reduction
+    pub fn reduce(&mut self) {
+        self.domain.reduce();
+    }
+
+    /// Get tnum representation
+    pub fn tnum(&self) -> Tnum {
+        *self.domain.tnum()
+    }
+
+    /// Get interval representation
+    pub fn interval(&self) -> &WrappedRange {
+        self.domain.interval()
+    }
+
+    /// Set new tnum and interval, then reduce
+    pub fn set_tnum_interval(&mut self, tnum: Tnum, interval: WrappedRange) {
+        *self.domain.tnum_mut() = tnum;
+        *self.domain.interval_mut() = interval;
+        self.reduce();
+    }
+
+    /// Set only tnum then reduce
+    pub fn set_tnum(&mut self, tnum: Tnum) {
+        *self.domain.tnum_mut() = tnum;
+        self.reduce();
+    }
+}
+
+/// Verifier state (all registers)
+#[derive(Clone, Debug)]
+pub struct VerifierState {
+    pub regs: [RegState; 11],  // r0-r10
+}
+
+impl Default for VerifierState {
+    fn default() -> Self {
+        Self {
+            regs: [
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+                RegState::default(),
+            ],
+        }
+    }
+}
+
+impl VerifierState {
+    fn new() -> Self {
+        let mut state = Self::default();
+
+        // r1 initialized as scalar (entry point argument)
+        state.regs[1] = RegState::new_scalar();
+
+        // r10 initialized as scalar (stack pointer)
+        state.regs[10] = RegState::new_scalar();
+
+        state
+    }
+
+    fn get_reg(&self, reg: u8) -> &RegState {
+        &self.regs[reg as usize]
+    }
+
+    fn get_reg_mut(&mut self, reg: u8) -> &mut RegState {
+        &mut self.regs[reg as usize]
+    }
+
+    fn set_reg_constant(&mut self, reg: u8, value: u64) {
+        self.regs[reg as usize] = RegState::new_constant(value);
+    }
+
+    fn set_reg_scalar(&mut self, reg: u8) {
+        self.regs[reg as usize] = RegState::new_scalar();
+    }
+}
+
+/// Abstract interpretation Verifier
+#[derive(Debug)]
+pub struct AbstractVerifier {}
+
+impl AbstractVerifier {
+    /// Abstract interpretation main loop
+    pub fn abstract_verify(
+        prog: &[u8],
+        _sbpf_version: SBPFVersion,
+    ) -> Result<(), VerifierError> {
+        let num_insns = prog.len() / ebpf::INSN_SIZE;
+        let mut state = VerifierState::new();
+        let mut insn_ptr = 0;
+
+        while insn_ptr < num_insns {
+            let insn = ebpf::get_insn(prog, insn_ptr);
+
+            match insn.opc {
+                // ===== BPF_ALU64_STORE class =====
+
+                // MOV
+                ebpf::MOV64_IMM => {
+                    state.set_reg_constant(insn.dst, insn.imm as i64 as u64);
+                }
+                ebpf::MOV64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+                    state.regs[insn.dst as usize] = state.regs[insn.src as usize].clone();
+                    state.regs[insn.dst as usize].reduce();
+                }
+
+                // ADD
+                ebpf::ADD64_IMM => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().add(imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().add(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ADD64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let new_tnum = dst.tnum().add(src_tnum);
+                    let new_range = dst.interval().add(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // SUB
+                ebpf::SUB64_IMM => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().sub(imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().sub(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::SUB64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().sub(src_tnum);
+                    let new_range = dst.interval().sub(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // MUL
+                ebpf::MUL64_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().mul(imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().mul(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::MUL64_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().mul(src_tnum);
+                    let new_range = dst.interval().mul(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // DIV
+                ebpf::DIV64_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = insn.imm as i64 as u64;
+                    if imm_val == 0 {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().udiv(imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().udiv(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::DIV64_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let divisor = state.get_reg(insn.src);
+                    let divisor_tnum = divisor.tnum();
+                    let divisor_range = divisor.interval();
+
+                    if !divisor_tnum.is_definitely_nonzero() || divisor_range.contains_zero() {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().udiv(src_tnum);
+                    let new_range = dst.interval().udiv(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // MOD
+                ebpf::MOD64_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = insn.imm as i64 as u64;
+                    if imm_val == 0 {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().urem(imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().urem(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::MOD64_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let divisor = state.get_reg(insn.src);
+                    let divisor_tnum = divisor.tnum();
+                    let divisor_range = divisor.interval();
+
+                    if !divisor_tnum.is_definitely_nonzero() || divisor_range.contains_zero() {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().urem(src_tnum);
+                    let new_range = dst.interval().urem(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // AND
+                ebpf::AND64_IMM => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().and(&imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().and(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::AND64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().and(&src_tnum);
+                    let new_range = dst.interval().and(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // OR
+                ebpf::OR64_IMM => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().or(&imm_tnum);
+
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().or(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::OR64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().or(&src_tnum);
+                    let new_range = dst.interval().or(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // XOR
+                ebpf::XOR64_IMM => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().xor(imm_tnum);
+                    dst.set_tnum(new_tnum);
+                }
+                ebpf::XOR64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().xor(src_tnum);
+                    dst.set_tnum(new_tnum);
+                }
+
+                // SHIFT: LSH, RSH, ARSH
+                ebpf::LSH64_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum();
+                    let imm_tnum = Tnum::const_val(imm_val as u64);
+                    let new_tnum = dst_tnum.shl(&imm_tnum);
+
+                    let dst_range = dst.interval();
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 64);
+                    let new_range = dst_range.shl(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::LSH64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().shl(&src_tnum);
+                    let new_range = dst.interval().shl(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::RSH64_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum();
+                    let imm_tnum = Tnum::const_val(imm_val as u64);
+                    let new_tnum = dst_tnum.lshr(&imm_tnum);
+
+                    let dst_range = dst.interval();
+                    let new_range = dst_range.lshr_const(imm_val as u64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::RSH64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = dst.tnum().lshr(&src_tnum);
+                    // Variable shift is imprecise; conservatively use top
+                    let new_range = WrappedRange::top(64);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ARSH64_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_range = dst.interval();
+                    let new_range = dst_range.ashr_const(imm_val as u64);
+
+                    let dst_tnum = dst.tnum();
+                    let new_tnum = dst_tnum.ashr_const(imm_val as u64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ARSH64_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_range = dst.interval().ashr(&src_range);
+                    let new_tnum = dst.tnum();
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // NEG
+                ebpf::NEG64 if !_sbpf_version.disable_neg() => {
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum();
+                    let new_tnum = dst_tnum.not().add(Tnum::const_val(1));
+
+                    // Negation interval is imprecise; set conservatively to top
+                    let new_range = WrappedRange::top(64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // ===== BPF_ALU32_LOAD class =====
+
+                // ADD32
+                ebpf::ADD32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.add(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.add(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ADD32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.add(src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.add(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // SUB32
+                ebpf::SUB32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.sub(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.sub(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::SUB32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.sub(src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.sub(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // MUL32
+                ebpf::MUL32_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.mul(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.mul(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::MUL32_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.mul(src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.mul(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // DIV32
+                ebpf::DIV32_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    if imm_val == 0 {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.udiv(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.udiv(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::DIV32_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let divisor_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let divisor_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    if !divisor_tnum.is_definitely_nonzero() || divisor_range.contains_zero() {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.udiv(src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.udiv(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // MOD32
+                ebpf::MOD32_IMM if !_sbpf_version.enable_pqr() => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    if imm_val == 0 {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.urem(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.urem(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::MOD32_REG if !_sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let divisor_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let divisor_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    if !divisor_tnum.is_definitely_nonzero() || divisor_range.contains_zero() {
+                        return Err(VerifierError::DivisionByZero(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.urem(src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.urem(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // AND32
+                ebpf::AND32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.and(&imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.and(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::AND32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.and(&src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.and(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // OR32
+                ebpf::OR32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.or(&imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.or(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::OR32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.or(&src_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.or(&src_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // XOR32
+                ebpf::XOR32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.xor(imm_tnum);
+
+                    // XOR range is imprecise on WrappedRange; use top conservatively
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::XOR32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.xor(src_tnum);
+
+                    // XOR range is imprecise on WrappedRange; use top conservatively
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // MOV32
+                ebpf::MOV32_IMM => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_range = WrappedRange::new_constant(imm_val as u64, 32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::MOV32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    dst.set_tnum_interval(src_tnum, src_range);
+                }
+
+                // SHIFT32: LSH, RSH, ARSH
+                ebpf::LSH32_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.shl(&imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.shl_const(imm_val as u64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::LSH32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.shl(&src_tnum);
+
+                    // Variable shift amount is imprecise; use top conservatively
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::RSH32_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.lshr(&imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.lshr_const(imm_val as u64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::RSH32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.lshr(&src_tnum);
+
+                    // Variable shift amount is imprecise; use top conservatively
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ARSH32_IMM => {
+                    let imm_val = insn.imm as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.ashr_const(imm_val as u64);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.ashr_const(imm_val as u64);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::ARSH32_REG => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let new_tnum = Tnum::top_with_width(32);
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // NEG32
+                ebpf::NEG32 if !_sbpf_version.disable_neg() => {
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.not().add(Tnum::const_val(1)).cast(4);
+
+                    let new_range = WrappedRange::top(32);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                // ===== BPF_PQR class =====
+                ebpf::LMUL32_IMM if _sbpf_version.enable_pqr() => {
+                    let imm_val = (insn.imm as i32) as u32;
+                    let dst = state.get_reg_mut(insn.dst);
+
+                    let dst_tnum = dst.tnum().cast(4);
+                    let imm_tnum = Tnum::const_val(imm_val as u64).cast(4);
+                    let new_tnum = dst_tnum.mul(imm_tnum);
+
+                    let dst_range = dst.interval().trunc(32);
+                    let imm_range = WrappedRange::new_constant(imm_val as u64, 32);
+                    let new_range = dst_range.mul(&imm_range);
+
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::LMUL32_REG if _sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+                    let src_tnum = state.get_reg(insn.src).tnum().cast(4);
+                    let src_range = state.get_reg(insn.src).interval().trunc(32);
+                    let dst = state.get_reg_mut(insn.dst);
+                    let dst_tnum = dst.tnum().cast(4);
+                    let new_tnum = dst_tnum.mul(src_tnum);
+                    let dst_range = dst.interval().trunc(32);
+                    let new_range = dst_range.mul(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::LMUL64_IMM if _sbpf_version.enable_pqr() => {
+                    let imm_val = insn.imm as i64 as u64;
+                    let dst = state.get_reg_mut(insn.dst);
+                    let imm_tnum = Tnum::const_val(imm_val);
+                    let new_tnum = dst.tnum().mul(imm_tnum);
+                    let imm_range = WrappedRange::new_constant(imm_val, 64);
+                    let new_range = dst.interval().mul(&imm_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+                ebpf::LMUL64_REG if _sbpf_version.enable_pqr() => {
+                    if !state.get_reg(insn.src).initialized {
+                        return Err(VerifierError::InvalidSourceRegister(insn_ptr));
+                    }
+                    let src_tnum = state.get_reg(insn.src).tnum();
+                    let src_range = state.get_reg(insn.src).interval().clone();
+                    let dst = state.get_reg_mut(insn.dst);
+                    let new_tnum = dst.tnum().mul(src_tnum);
+                    let new_range = dst.interval().mul(&src_range);
+                    dst.set_tnum_interval(new_tnum, new_range);
+                }
+
+                ebpf::EXIT => {
+                    break;
+                }
+
+                _ => {
+                    if insn.dst <= 9 {
+                        state.set_reg_scalar(insn.dst);
+                    }
+                }
+            }
+
+            insn_ptr += 1;
+        }
+
+        Ok(())
+    }
+}
