@@ -41,9 +41,12 @@ pub mod jit;
 mod memory_management;
 pub mod memory_region;
 pub mod program;
+pub mod reduced_product;
 pub mod static_analysis;
+pub mod tnum;
 pub mod verifier;
 pub mod vm;
+pub mod wrapped_interval;
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 mod x86;
 
